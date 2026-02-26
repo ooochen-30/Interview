@@ -236,7 +236,7 @@ RMSNorm比LayerNorm好的地方主要体现在3点：（**不牺牲模型性能*
 2. 效果相当：在深层Transformer网络，**控制特征的尺度**才是归一化起效的关键
 3. 实现更简洁：通常也去掉了偏置项β，减少了参数量
 
-**Transformer是如何实现并行化计算的？**
+**23. Transformer是如何实现并行化计算的？**
 
 Transformer实现并行化的核心是**彻底摈弃了RNN的时序串行依赖，讲序列维度的计算转化为矩阵级的全并行运算**，体现在三个核心模块：
 
@@ -244,11 +244,33 @@ Transformer实现并行化的核心是**彻底摈弃了RNN的时序串行依赖�
 + 前馈网络FFN对每个token做独立的非线性变化，不同token之间无任何依赖关系
 + 输入层的嵌入与位置编码都可以通过查表和预定义/可学习的固定矩阵得到，无时序约束
 
-**除了MHA还知道哪些Attention变体，讲讲他们的原理和使用场景？**
+**24. 除了MHA还知道哪些Attention变体，讲讲他们的原理和使用场景？**
 
++ MQA(Multi-Query Attention 多查询注意力)：Q保留多头，K/V所有头共享一套。他的优点是**大幅降低KV Cache的显存占用（MHA的1/h）**，推理速度提升显著；主要适用于大模型的**推理阶段**
++ GQA(Grouped-Query Attention 分组查询注意力)：Q保留多头，K/V分组共享。是MHA和MQA的折中方案；适用于大模型**训练+推理全阶段**。
++ Linear Attention(线性注意力)：改造注意力计算方式，将$QK^T$的平方级计算转为线性级；通过**核函数**（如 Softmax 核、正余弦核）将注意力权重的计算拆解为**Q、K 的逐元素乘积 + 累加**，避开 n×n 的矩阵乘法；适用于**超长序列**任务
 
+**25. Multi-Head Attention现在有一些优化，主流的优化都由哪些方向，每个方向下有什么优化方法？**
 
-**手写一下SelfAttention**
+1. 头数与KV映射优化：解决原生MHA的Q/K/V一一对应，KV cache显存随头数线性增加问题，**显著降低推理显存占用，提升生成速度**。优化方法包括MQA和GQA
+
+2. 注意力稀疏化：解决原生MHA的**$O(n^2d)$平方级复杂度**，将其降为**线性/亚线性**，支持万级以上超长序列建模。优化方法包括滑动窗口注意力、局部+全局稀疏注意力、LSH注意力等
+
+   > 滑动窗口注意力：每个token仅关注自身±k个局部窗口内的token，避免全量n*n的计算
+   >
+   > 局部+全局稀疏注意力(Longformer)：大部分token用滑动窗口(局部)，少数关键token（如<cls>/标点）用全局注意力，既降复杂度又保留长距离依赖
+
+3. 线性注意力改造：通过数学变换改造注意力计算逻辑，彻底摈弃平方级矩阵乘法，实现纯线性复杂度。优化方法包括核函数线性注意力、低秩分解注意力等
+
+4. 工程与硬件层优化：通过显存调度、硬件适配、计算逻辑重排，提升GPU/TPU算力利用率，降低实际训练/推理耗时。优化方法包括FlashAttention/FlashAttention-2、注意力算子融合、张量并行等
+
+   > FlashAttention/FlashAttention-2：核心是**显存分块+计算重排+重计算**，将注意力计算拆分为小分块适配GPU显存，避免中间结果的显存冗余，同时利用GPU的SM核心做并行计算
+   >
+   > 张量并行(Megatron-LM)：将Q/K/V矩阵**按头数/维度拆分到多个GPU**，多卡并行计算注意力，再合并结果（超大规模模型的分布式训练）
+
+5. 注意力与模型结构融合优化：将MHA与Transformer其他组件（如FFN/PE）结合优化，或针对特定任务/场景定制注意力逻辑。如带偏置/门控的注意力、相对位置注意力、MoE注意力等
+
+**26. 手写一下SelfAttention**
 
 ```python
 import math
@@ -312,9 +334,7 @@ class SelfAttention(nn.Module):
         return output
 ```
 
-
-
-**手写一下Multi-Head Attention**
+**27. 手写一下Multi-Head Attention**
 
 ```python
 import math
@@ -369,6 +389,110 @@ class MultiHeadAttention(nn.Module):
         return output
 ```
 
-**为什么合并头时要使用.contiguous?**
+**28. 为什么合并头时要使用.contiguous?**
 
 transpose后的Tensor在内存中是不连续的（它只改变了步长映射）。而view操作要求Tensor并需在内存中连续，因此需要先.contiguous，否则会出现RuntimeError。
+
+**29. MHA/MQA最后接o_proj的作用是什么？**
+
+MHA/MQA 最后接的 o_proj（输出投影层）是**必不可以少的核心组件**，他的作用主要有三个：
+
+1. 多头拆分计算后，特征是碎片化的，o_proj 能整合不同头的特征，实现**跨头信息交互，融合多种注意力模式**；
+
+2. 拼接后的特征维度虽回到模型维度，但**分布碎片化**，o_proj 能校准特征分布，适配后续的 FFN、残差等组件；
+
+3. o_proj 的可学习参数能**自适应调整多头特征的融合权重**，提升模型表达能力。
+
+简单说，o_proj 是 “多头拆分计算” 到 “全局特征融合” 的关键一步，去掉后模型的特征会碎片化，表达能力大幅下降。
+
+**30. 手写一下Multi-Query Attention**
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class MultiQueryAttention(nn.Module):
+    def __init__(self,dim,query_num,dropout_rate):
+        super().__init__()
+        self.dim = dim
+        self.query_num = query_num
+        self.query_dim = dim // query_num
+        
+        self.dropout = nn.Dropout(dropout_rate)
+        
+        self.q_proj = nn.Linear(dim,dim)
+        self.k_proj = nn.Linear(dim,self.query_dim)
+        self.v_proj = nn.Linear(dim,self.query_dim)
+        self.o_proj = nn.Linear(dim,dim) # 先合并头，再过映射
+	
+    def forward(self, x):
+        batch, seq, _ = x.size()
+        
+        q = self.q_proj(x) # [batch, seq, dim]
+        k = self.k_proj(x) # [batch, seq, query_dim]
+        v = self.v_proj(x)
+        
+        q_state = q.view(batch, seq, self.query_num -1).transpose(1,2) # [batch, query_num, seq, query_dim]
+        k_state = k.unsqueeze(1) # [batch, 1, seq, query_dim]
+        v_state = v.unsqueeze(1)
+        
+        # 利用广播机制
+        attn = torch.matmul(q_state,k_state.transpose(-1,-2))/ math.sqrt(self.query_dim)
+        attn = torch.softmax(attn, dim=-1)
+        
+        attn = self.dropout(attn)
+        # [batch,query_num,seq,query_dim]->[batch,seq,query_num,query_dim]
+        attn = torch.matmul(attn, v_state).transpose(1,2).contiguous().view(batch,seq,-1)
+        
+        # 先合并头再过proj 在数学计算上等价，在工程实现上更高效，也更符合Transformer的标准定义-先将各头捕获的特征维度上堆叠，再通过W_o矩阵实现头间信息的融合
+        output = self.o_proj(attn)
+        return output
+```
+
+**31. 手写一下Group-Query Attention**
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+class GroupQueryAttention(nn.Module):
+    def __init__(self, dim, num_query, num_kv, dropout_rate):
+        super().__init__()
+        self.dim = dim
+        self.num_query = num_query
+        self.head_dim = dim // num_query
+        self.num_kv = num_kv # num_kv=1时即为MQA
+        self.num_q_per_kv num_query // num_kv # 重点：计算每组kv有多少q
+        
+        self.dropout = nn.Dropout(dropout_rate)
+        self.q_proj = nn.Linear(dim,dim)
+        self.k_proj = nn.Linear(dim,self.head_dim*num_kv)
+        self.v_proj = nn.Linear(dim,self.head_dim*num_kv)
+        self.o_proj = nn.Linear(dim,dim)
+        
+    def forward(self,x):
+        batch,seq,_ = x.size()
+        
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        
+        q_state = q.view(batch, seq, self.num_query, -1).transpose(1,2)
+        k_state = k.view(batch, seq, self.num_kv, -1).transpoer(1,2)
+        v_state = v.view(batch, seq, self.num_kv, -1).transpose(1,2)
+        
+        # GQA的核心步骤 repeats表示每个KV头被重复多少次
+        k_state = torch.repeat_interleave(k_state, repeats=self.num_q_per_kv, dim=1)
+        v_state = torch.repeat_interleave(v_state, repeats=self.num_q_per_kv, dim=1)
+        
+        attn = torch.matmul(q_state,k_state.transpose(-1,-2)) / math.sqrt(self.head_dim)
+        attn = torch.softmax(attn,dim=-1)
+        attn = self.dropout(attn)
+        
+        attn = torch.matmul(attn, v_state).transpose(1,2).contiguous().view(batch,seq,-1)
+        output = self.o_proj(attn)
+        return output
+```
+
