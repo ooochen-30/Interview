@@ -496,3 +496,9 @@ class GroupQueryAttention(nn.Module):
         return output
 ```
 
+**待补充**：
+
+FlashAttention
+
+Prefix Decoder, Casual Decoder，Encoder-Decoder的区别
+
